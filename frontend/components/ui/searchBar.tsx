@@ -190,6 +190,7 @@ export function Component() {
             <div className=" order-1 md:order-2 flex flex-row gap-5 md:gap-20">
               <div className="flex mt-4 ">
                 <Button
+                
                   onClick={handlePreview}
                   className="mr-2"
                   disabled={isLoadingDownload || isSelectDisabled}

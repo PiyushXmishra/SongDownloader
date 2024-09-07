@@ -1,11 +1,15 @@
 import { Router } from "express";
-import { Storage } from "@google-cloud/storage";
 import { exec } from "child_process";
 import { promisify } from "util";
-import dotenv from "dotenv";
 import crypto from "crypto";
+import express from "express";
+import multer from "multer";
 import path from "path";
 import fs from "fs";
+import { GoogleAuth } from "google-auth-library";
+import dotenv from "dotenv";
+
+import { google } from "googleapis";
 
 dotenv.config();
 
@@ -22,10 +26,10 @@ const resolutionFormatIds: { [resolution: string]: string[] } = {
   "1080p": ["270", "614"],
   "1440p": ["620"],
   "2160p": ["625"],
-  "720p60":["311"],
-  "1080p60":["312"],
-  "1440p60":["623"],
-  "2160p60":["628"]
+  "720p60": ["311"],
+  "1080p60": ["312"],
+  "1440p60": ["623"],
+  "2160p60": ["628"],
 };
 
 const generateUniqueFilename = (base: string): string => {
@@ -33,11 +37,6 @@ const generateUniqueFilename = (base: string): string => {
   const randomStr = crypto.randomBytes(6).toString("hex"); // Generates a random string
   return `${base}_${timestamp}_${randomStr}`;
 };
-
-const projectId = process.env.PROJECT_ID;
-const keyFilename = process.env.KEYFILENAME;
-const bucketName = process.env.BUCKET_NAME;
-const storage = new Storage({ projectId, keyFilename });
 
 /**
  * Get all available formats for a given YouTube video URL and return unique quality labels.
@@ -50,17 +49,22 @@ async function getQualityLabels(videoUrl: string): Promise<string[]> {
     const formatLines = formatsStdout.split("\n").slice(4); // Skip the first few header lines
 
     // Get video metadata
-    const { stdout: metadataStdout } = await execAsync(`yt-dlp --skip-download --get-title --get-thumbnail --get-duration ${videoUrl}`);
+    const { stdout: metadataStdout } = await execAsync(
+      `yt-dlp --skip-download --get-title --get-thumbnail --get-duration ${videoUrl}`
+    );
     const metadataLines = metadataStdout.split("\n");
 
     const Title = metadataLines[0];
     const ThumbnailURL = metadataLines[1];
     const Duration = metadataLines[2];
 
-    const Metadata = {Title,ThumbnailURL,Duration}
+    const Metadata = { Title, ThumbnailURL, Duration };
     // Define a function to extract quality label
+
     const extractQuality = (info: string) => {
-      const match = info.match(/\b(?:144|240|360|480|720|1080|1440|2160)p(?:60)?\b/);
+      const match = info.match(
+        /\b(?:144|240|360|480|720|1080|1440|2160)p(?:60)?\b/
+      );
       return match ? match[0] : null;
     };
 
@@ -92,11 +96,51 @@ async function getQualityLabels(videoUrl: string): Promise<string[]> {
         return !quality.endsWith("60");
       }
     });
-//@ts-ignore
-    return {qualities:filteredQualities, Metadata:Metadata};
+    //@ts-ignore
+    console.log(filteredQualities, Metadata);
+    //@ts-ignore
+    return { qualities: filteredQualities, Metadata: Metadata };
   } catch (error) {
     console.error("Error fetching video formats:", error);
     throw error;
+  }
+}
+
+const upload = multer();
+
+const SERVICE_ACCOUNT_FILE = process.env.GOOGLE_SERVICE_ACCOUNT_FILE || "";
+
+const auth = new GoogleAuth({
+  keyFile: SERVICE_ACCOUNT_FILE,
+  scopes: ["https://www.googleapis.com/auth/drive"],
+});
+//@ts-ignore
+const drive = google.drive({ version: "v3", auth });
+
+async function uploadFileToDrive(
+  filePath: string
+): Promise<string | undefined> {
+  const requestBody = {
+    name: path.basename(filePath),
+    fields: "id",
+  };
+
+  const media = {
+    mimeType: "video/mp4", // Ensure correct MIME type for your video
+    body: fs.createReadStream(filePath),
+  };
+
+  try {
+    const response = await drive.files.create({
+      requestBody,
+      media,
+    });
+    console.log("File Id:", response.data.id);
+    //@ts-ignore
+    return response.data.id;
+  } catch (err) {
+    console.error("Error uploading file:", err);
+    throw err;
   }
 }
 
@@ -134,11 +178,25 @@ router.post("/download", async (req, res) => {
     const parentDirectory = path.join(currentDirectory, "..");
     const filepath = path.join(parentDirectory, `${uniqueFilename}.mp4`);
     try {
-      //@ts-ignore
-      const uploadedFile = await uploadFile(bucketName, filepath, `${uniqueFilename}.mp4`);
-      const previewUrl = `https://storage.googleapis.com/${bucketName}/${uniqueFilename}.mp4`;
-      //@ts-ignore
-      const DownloadUrl = uploadedFile[0].metadata.mediaLink;
+      const fileId = await uploadFileToDrive(filepath);
+
+      if (!fileId) {
+        return res.status(500).send("Failed to upload file");
+      }
+
+      await drive.permissions.create({
+        fileId: fileId,
+        requestBody: {
+          role: "reader",
+          type: "anyone",
+        },
+      });
+
+      const result = await drive.files.get({
+        fileId: fileId,
+        fields: "webViewLink",
+      });
+      console.log(result.data.webViewLink);
 
       // Delete the local file after successful upload
       fs.unlink(filepath, (err) => {
@@ -149,14 +207,13 @@ router.post("/download", async (req, res) => {
         }
       });
 
-      // Schedule GCP deletion
-      //@ts-ignore
-      scheduleGCPDeletion(bucketName, `${uniqueFilename}.mp4`, 5 * 60 * 1000); // 5 minutes
+      const previewUrl = result.data.webViewLink;
+      const DownloadUrl = `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t`;
 
       res.json({
         message: "Download, merge, and upload completed.",
-        DownloadUrl,
         previewUrl,
+        DownloadUrl,
       });
     } catch (error) {
       res.status(500).json({ error: "Failed to upload." });
@@ -181,37 +238,20 @@ async function downloadAndMerge(
   }
 }
 
-async function uploadFile(
-  bucketName: string,
-  file: string,
-  fileOutputName: any
-) {
-  try {
-    // Get a reference to the specified bucket
-    const bucket = storage.bucket(bucketName);
+// async function uploadFile() {
+//   try {
 
-    // Upload the specified file to the bucket with the given destination name
-    const ret = await bucket.upload(file, {
-      destination: fileOutputName,
-    });
+//   } catch (error) {
+//     // Handle any errors that occur during the upload process
+//     console.error("Error:", error);
+//   }
+// }
 
-    // Return the result of the upload operation
-    return ret;
-  } catch (error) {
-    // Handle any errors that occur during the upload process
-    console.error("Error:", error);
-  }
-}
-
-function scheduleGCPDeletion(bucketName: string, fileName: string, delay: number) {
+function scheduleGCPDeletion() {
   setTimeout(async () => {
     try {
-      await storage.bucket(bucketName).file(fileName).delete();
-      console.log(`Successfully deleted GCP file: ${fileName}`);
-    } catch (err) {
-      console.error(`Failed to delete GCP file: ${fileName}`, err);
-    }
-  }, delay);
+    } catch (err) {}
+  });
 }
 
 export default router;
