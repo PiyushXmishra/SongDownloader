@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
+    "install:yt-dlp": "python3 yt-dlpScript.py",
     "test": "echo \"Error: no test specified\" && exit 1",
     "build": "tsc -b",
     "start": "tsc -b && node dist/index.js"
@@ -23,6 +24,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "ts-node": "^10.9.2",
     "typescript": "^5.5.2"
   }
 }

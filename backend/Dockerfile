@@ -24,11 +24,11 @@ RUN pip3 install --no-cache-dir yt-dlp
 
 WORKDIR /app
 
-COPY backend/package*.json ./
+COPY package*.json ./
 
 RUN NODE_ENV=development npm install
 
-COPY backend .
+COPY . .
 
 RUN npm install -g typescript
 
